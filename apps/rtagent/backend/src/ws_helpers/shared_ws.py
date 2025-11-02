@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from functools import partial
 import json
+import time
 import uuid
 from contextlib import suppress
 from typing import Optional
@@ -143,6 +144,10 @@ async def send_tts_audio(
         ws, "tts_cancel_event"
     )
 
+    voice_to_use = voice_name or GREETING_VOICE_TTS
+    style = voice_style or "conversational"
+    eff_rate = rate or "medium"
+
     try:
         (
             synth,
@@ -182,6 +187,8 @@ async def send_tts_audio(
             cancel_event.clear()
             return
 
+        now = time.monotonic()
+
         if not _set_connection_metadata(ws, "is_synthesizing", True):
             logger.debug("[%s] Unable to flag is_synthesizing=True", session_id)
         if not _set_connection_metadata(ws, "audio_playing", True):
@@ -192,10 +199,7 @@ async def send_tts_audio(
         except Exception:
             pass
 
-        # Use voice settings
-        voice_to_use = voice_name or GREETING_VOICE_TTS
-        style = voice_style or "conversational"
-        eff_rate = rate or "medium"
+        _set_connection_metadata(ws, "last_tts_start_ts", now)
 
         # One-time voice warm-up to avoid first-response decoder stalls
         warm_signature = (voice_to_use, style, eff_rate)
@@ -292,6 +296,7 @@ async def send_tts_audio(
                         session_id,
                         run_id,
                     )
+                    _set_connection_metadata(ws, "last_tts_end_ts", time.monotonic())
                     return
 
             pcm_bytes = await synthesis_task
@@ -310,6 +315,7 @@ async def send_tts_audio(
                 session_id,
                 run_id,
             )
+            _set_connection_metadata(ws, "last_tts_end_ts", time.monotonic())
             return
 
         _lt_stop(
@@ -440,6 +446,7 @@ async def send_tts_audio(
             pass
         if cancel_event:
             cancel_event.clear()
+        _set_connection_metadata(ws, "last_tts_end_ts", time.monotonic())
 
         # Enhanced pool management with dedicated clients
         if session_id:

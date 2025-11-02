@@ -1413,7 +1413,12 @@ class StreamingSpeechRecognizerFromBytes:
                     detected_lang,
                     speaker_id,
                 )
-                self.final_callback(evt.result.text, detected_lang, speaker_id)
+                try:
+                    # Prefer the richer signature when the callback supports it.
+                    self.final_callback(evt.result.text, detected_lang, speaker_id)
+                except TypeError:
+                    # Backwards compatibility for callbacks expecting two args.
+                    self.final_callback(evt.result.text, detected_lang)
             elif evt.result.text:
                 logger.debug(
                     f"⚠️ Got final text but no final_callback: '{evt.result.text}'"

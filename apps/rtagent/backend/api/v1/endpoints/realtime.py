@@ -34,8 +34,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
-from typing import Optional, Set
+from typing import Optional
 from datetime import datetime
 
 from fastapi import (
@@ -90,11 +91,9 @@ from apps.rtagent.backend.src.utils.auth import validate_acs_ws_auth, AuthError
 logger = get_logger("api.v1.endpoints.realtime")
 tracer = trace.get_tracer(__name__)
 
-# Sentinel for state lookups
 _STATE_SENTINEL = object()
 
 router = APIRouter()
-
 
 @router.get(
     "/status",
@@ -102,7 +101,7 @@ router = APIRouter()
     summary="Get Realtime Service Status",
     description="""
     Get the current status of the realtime communication service.
-    
+
     Returns information about:
     - Service availability and health
     - Supported protocols and features
@@ -126,10 +125,14 @@ router = APIRouter()
                             "conversation_streaming": True,
                             "orchestrator_support": True,
                             "session_management": True,
+                            "audio_interruption": True,
+                            "precise_routing": True,
+                            "connection_queuing": True,
                         },
                         "active_connections": {
                             "dashboard_clients": 0,
                             "conversation_sessions": 0,
+                            "total_connections": 0,
                         },
                         "version": "v1",
                     }
@@ -501,6 +504,8 @@ async def _initialize_conversation_session(
             "audio_playing": False,
             "tts_cancel_requested": False,
             "greeting_sent": greeting_sent,
+            "last_tts_start_ts": 0.0,
+            "last_tts_end_ts": 0.0,
         }
 
         if handler is None or isinstance(handler, dict):
@@ -546,6 +551,121 @@ async def _initialize_conversation_session(
             )
             # Optionally, raise an exception instead of logging:
             # raise RuntimeError("No running event loop for thread-safe metadata update")
+
+    async def _perform_barge_in(
+        trigger: str,
+        stage: str,
+        *,
+        energy_level: float | None = None,
+    ) -> None:
+        """Cancel active TTS playback and orchestration tasks for barge-in."""
+        is_synthesizing = get_metadata("is_synthesizing", False)
+        audio_playing = get_metadata("audio_playing", False)
+        cancel_requested = get_metadata("tts_cancel_requested", False)
+
+        if not (is_synthesizing or audio_playing or cancel_requested):
+            return
+
+        if get_metadata("barge_in_inflight", False):
+            return
+
+        set_metadata("barge_in_inflight", True)
+        now = time.monotonic()
+
+        try:
+            last_trigger = get_metadata("last_barge_in_trigger", None)
+            last_ts = get_metadata("last_barge_in_ts", 0.0)
+            if last_trigger == trigger and (now - last_ts) < 0.05:
+                return
+
+            set_metadata("last_barge_in_ts", now)
+            set_metadata("last_barge_in_trigger", trigger)
+            set_metadata("is_synthesizing", False)
+            set_metadata("audio_playing", False)
+            set_metadata("tts_cancel_requested", True)
+
+            logger.info(
+                "[%s] Barge-in triggered (trigger=%s, stage=%s, energy=%.2f, was_syn=%s, was_playing=%s)",
+                session_id,
+                trigger,
+                stage,
+                energy_level or 0.0,
+                is_synthesizing,
+                audio_playing,
+            )
+
+            tts_client = get_metadata("tts_client")
+            if tts_client:
+                try:
+                    tts_client.stop_speaking()
+                except Exception as stop_exc:  # noqa: BLE001
+                    logger.debug("[%s] TTS stop_speaking error during barge-in: %s", session_id, stop_exc)
+
+            cancel_event = get_metadata("tts_cancel_event")
+            if cancel_event:
+                cancel_event.set()
+
+            tasks = getattr(websocket.state, "orchestration_tasks", set())
+            active_tasks = [task for task in list(tasks) if task and not task.done()]
+            if active_tasks:
+                logger.info(
+                    "[%s] Cancelling %s orchestration task(s) due to barge-in", session_id, len(active_tasks)
+                )
+                for task in active_tasks:
+                    task.cancel()
+                for task in active_tasks:
+                    try:
+                        await asyncio.wait_for(task, timeout=0.3)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    except Exception as cancel_exc:  # noqa: BLE001
+                        logger.debug(
+                            "[%s] Orchestration cancel error during barge-in: %s",
+                            session_id,
+                            cancel_exc,
+                        )
+                    finally:
+                        tasks.discard(task)
+
+            cancel_msg = {
+                "type": "control",
+                "action": "tts_cancelled",
+                "reason": "barge_in",
+                "trigger": trigger,
+                "at": stage,
+                "session_id": session_id,
+            }
+            if energy_level is not None:
+                cancel_msg["energy"] = round(energy_level, 2)
+
+            try:
+                await websocket.app.state.conn_manager.send_to_connection(
+                    conn_id, cancel_msg
+                )
+            except Exception as send_exc:  # noqa: BLE001
+                logger.debug("[%s] Failed to dispatch barge-in cancel control: %s", session_id, send_exc)
+
+        finally:
+            set_metadata("barge_in_inflight", False)
+
+    def request_barge_in(
+        trigger: str,
+        stage: str,
+        *,
+        energy_level: float | None = None,
+    ) -> None:
+        loop = getattr(websocket.state, "_loop", None)
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(
+                asyncio.create_task,
+                _perform_barge_in(trigger, stage, energy_level=energy_level),
+            )
+        else:
+            asyncio.create_task(_perform_barge_in(trigger, stage, energy_level=energy_level))
+
+    set_metadata("request_barge_in", request_barge_in)
+    set_metadata("last_barge_in_ts", 0.0)
+    set_metadata("barge_in_inflight", False)
 
     if not greeting_sent:
         # Send greeting message using new envelope format
@@ -602,95 +722,52 @@ async def _initialize_conversation_session(
 
     # Set up STT callbacks
     def on_partial(txt: str, lang: str, speaker_id: str):
+        if not txt or not txt.strip():
+            return
         logger.info(f"[{session_id}] User (partial) in {lang}: {txt}")
         try:
-            # Check both synthesis flag and session audio state for barge-in
-            is_synthesizing = get_metadata("is_synthesizing", False)
+            now = time.monotonic()
+            is_synth = get_metadata("is_synthesizing", False)
             audio_playing = get_metadata("audio_playing", False)
-            logger.info(
-                "[%s] partial cancel gate (is_syn=%s, playing=%s, cancel_flag=%s)",
-                session_id,
-                get_metadata("is_synthesizing", None),
-                get_metadata("audio_playing", None),
-                get_metadata("tts_cancel_requested", None),
-            )
-            if is_synthesizing or audio_playing:
-                # Interrupt TTS synthesizer immediately
-                tts_client = get_metadata("tts_client")
-                if tts_client:
-                    tts_client.stop_speaking()
+            cancel_requested = get_metadata("tts_cancel_requested", False)
+            last_tts_start = get_metadata("last_tts_start_ts", 0.0) or 0.0
+            last_tts_end = get_metadata("last_tts_end_ts", 0.0) or 0.0
 
-                # Clear both synthesis flag and audio state
-                set_metadata_threadsafe("is_synthesizing", False)
-                set_metadata_threadsafe("audio_playing", False)
-                set_metadata_threadsafe("tts_cancel_requested", True)
+            recent_tts = False
+            if last_tts_start:
+                within_active_window = (now - last_tts_start) <= 1.2
+                no_recorded_end = last_tts_end <= last_tts_start
+                ended_recently = last_tts_end and (now - last_tts_end) <= 0.25
+                recent_tts = within_active_window and (no_recorded_end or ended_recently)
 
+            if is_synth or audio_playing or recent_tts:
                 cancel_event = get_metadata("tts_cancel_event")
                 if cancel_event:
-                    loop = getattr(websocket.state, "_loop", None)
-                    if loop and loop.is_running():
-                        loop.call_soon_threadsafe(cancel_event.set)
-                    else:
-                        cancel_event.set()
+                    cancel_event.set()
 
-                async def _cancel_background_orchestration():
-                    tasks = getattr(websocket.state, "orchestration_tasks", set())
-                    active = [task for task in list(tasks) if task and not task.done()]
-                    if not active:
-                        return
-                    logger.info(
-                        "[%s] Cancelling %s orchestration task(s) due to partial barge-in",
-                        session_id,
-                        len(active),
-                    )
-                    for task in active:
-                        task.cancel()
-                    for task in active:
-                        try:
-                            await asyncio.wait_for(task, timeout=0.3)
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
-                            pass
-                        except Exception as cancel_exc:  # noqa: BLE001
-                            logger.debug(
-                                "[%s] Orchestration cancel error: %s",
-                                session_id,
-                                cancel_exc,
-                            )
-                        finally:
-                            tasks.discard(task)
+                set_metadata_threadsafe("tts_cancel_requested", True)
+                set_metadata_threadsafe("audio_playing", False)
+                set_metadata_threadsafe("is_synthesizing", False)
+            elif cancel_requested:
+                set_metadata_threadsafe("tts_cancel_requested", False)
 
+            request_cancel = get_metadata("request_barge_in")
+            if callable(request_cancel):
+                request_cancel("stt_partial", "partial")
+            else:
+                # Fall back to direct barge-in if helper is unavailable.
                 loop = getattr(websocket.state, "_loop", None)
                 if loop and loop.is_running():
                     loop.call_soon_threadsafe(
-                        asyncio.create_task, _cancel_background_orchestration()
-                    )
-                else:
-                    asyncio.create_task(_cancel_background_orchestration())
-
-                # Notify UI to flush any buffered audio
-                cancel_msg = {
-                    "type": "control",
-                    "action": "tts_cancelled",
-                    "reason": "barge_in",
-                    "at": "partial",
-                    "session_id": session_id,
-                }
-                if loop and loop.is_running():
-                    loop.call_soon_threadsafe(
                         asyncio.create_task,
-                        websocket.app.state.conn_manager.send_to_connection(
-                            conn_id, cancel_msg
-                        ),
+                        _perform_barge_in("stt_partial", "partial"),
                     )
                 else:
-                    # Best-effort fallback
                     asyncio.create_task(
-                        websocket.app.state.conn_manager.send_to_connection(
-                            conn_id, cancel_msg
-                        )
+                        _perform_barge_in("stt_partial", "partial")
                     )
         except Exception as e:
-            logger.debug(f"Failed to dispatch UI cancel control: {e}")
+            logger.debug(f"Failed to dispatch barge-in request from partial: {e}")
 
     def on_cancel(evt) -> None:
         try:
