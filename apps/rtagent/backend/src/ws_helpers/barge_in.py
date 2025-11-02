@@ -56,10 +56,6 @@ class BargeInController:
         self.set_metadata("barge_in_inflight", True)
         now = time.monotonic()
 
-        try:
-            self.set_metadata("energy_barge_hits", 0)
-        except Exception:  # noqa: BLE001
-            pass
 
         try:
             last_trigger = self.get_metadata("last_barge_in_trigger", None)

@@ -15,7 +15,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import WebSocket
 from opentelemetry import trace
@@ -36,11 +36,13 @@ from apps.rtagent.backend.src.agents.artagent.tool_store.tools_helper import (
     push_tool_start,
 )
 from apps.rtagent.backend.src.helpers import add_space
-from src.aoai.client import client as default_aoai_client
+from src.aoai.client import client as default_aoai_client, create_azure_openai_client
 from apps.rtagent.backend.src.ws_helpers.shared_ws import (
     broadcast_message,
+    get_connection_metadata,
     push_final,
     send_response_to_acs,
+    send_session_envelope,
     send_tts_audio,
 )
 from apps.rtagent.backend.src.ws_helpers.envelopes import make_assistant_streaming_envelope
@@ -434,6 +436,7 @@ async def _emit_streaming_text(
             "gpt_flow.emit_streaming_text", attributes=span_attrs
         ) as span:
             try:
+                playback_status = "completed"
                 if is_acs:
                     span.set_attribute("output_channel", "acs")
                     await send_response_to_acs(
@@ -443,6 +446,9 @@ async def _emit_streaming_text(
                         voice_name=voice_name,
                         voice_style=voice_style,
                         rate=voice_rate,
+                    )
+                    playback_status = get_connection_metadata(
+                        ws, "acs_last_playback_status", "completed"
                     )
                 else:
                     span.set_attribute("output_channel", "websocket_tts")
@@ -454,28 +460,37 @@ async def _emit_streaming_text(
                         voice_style=voice_style,
                         rate=voice_rate,
                     )
-                    # ✅ SAFE: Use session-aware envelope and connection manager
-                    envelope = make_assistant_streaming_envelope(
-                        content=text,
-                        session_id=session_id,
-                    )
-                    if hasattr(ws.app.state, 'conn_manager') and hasattr(ws.state, 'conn_id'):
-                        await ws.app.state.conn_manager.send_to_connection(
-                            ws.state.conn_id, envelope
-                        )
-                    else:
-                        # Fallback for connections not managed by ConnectionManager
-                        await ws.send_text(json.dumps({
-                            "type": "assistant_streaming",
-                            "content": text,
-                            "speaker": _get_agent_sender_name(cm, include_autoauth=True),
-                        }))
-                span.add_event("text_emitted", {"text_length": len(text)})
+                envelope = make_assistant_streaming_envelope(
+                    content=text,
+                    sender=_get_agent_sender_name(cm, include_autoauth=True),
+                    session_id=session_id,
+                )
+                envelope["speaker"] = envelope.get("sender")
+                envelope["message"] = text  # Legacy compatibility for dashboards
+                conn_id = None if is_acs else getattr(ws.state, "conn_id", None)
+                await send_session_envelope(
+                    ws,
+                    envelope,
+                    session_id=session_id,
+                    conn_id=conn_id,
+                    event_label="assistant_streaming",
+                    broadcast_only=is_acs,
+                )
+
+                span.add_event(
+                    "text_emitted",
+                    {
+                        "text_length": len(text),
+                        "output_channel": "acs" if is_acs else "websocket",
+                        "acs.playback_status": playback_status,
+                    },
+                )
             except Exception as exc:  # noqa: BLE001
                 span.record_exception(exc)
                 logger.exception("Failed to emit streaming text")
                 raise
     else:
+        playback_status = "completed"
         if is_acs:
             await send_response_to_acs(
                 ws,
@@ -484,6 +499,9 @@ async def _emit_streaming_text(
                 voice_name=voice_name,
                 voice_style=voice_style,
                 rate=voice_rate,
+            )
+            playback_status = get_connection_metadata(
+                ws, "acs_last_playback_status", "completed"
             )
         else:
             await send_tts_audio(
@@ -494,23 +512,23 @@ async def _emit_streaming_text(
                 voice_style=voice_style,
                 rate=voice_rate,
             )
-            # ✅ SAFE: Use session-aware envelope and connection manager
-            envelope = make_assistant_streaming_envelope(
-                content=text,
-                session_id=session_id,
-            )
-            if hasattr(ws.app.state, 'conn_manager') and hasattr(ws.state, 'conn_id'):
-                await ws.app.state.conn_manager.send_to_connection(
-                    ws.state.conn_id, envelope
-                )
-            else:
-                # Fallback for connections not managed by ConnectionManager
-                speaker = _get_agent_sender_name(cm, include_autoauth=True)
-                await ws.send_text(
-                    json.dumps(
-                        {"type": "assistant_streaming", "content": text, "speaker": speaker}
-                    )
-                )
+
+        envelope = make_assistant_streaming_envelope(
+            content=text,
+            sender=_get_agent_sender_name(cm, include_autoauth=True),
+            session_id=session_id,
+        )
+        envelope["speaker"] = envelope.get("sender")
+        envelope["message"] = text  # Legacy compatibility for dashboards
+        conn_id = None if is_acs else getattr(ws.state, "conn_id", None)
+        await send_session_envelope(
+            ws,
+            envelope,
+            session_id=session_id,
+            conn_id=conn_id,
+            event_label="assistant_streaming",
+            broadcast_only=is_acs,
+        )
 
 
 async def _broadcast_dashboard(
@@ -729,6 +747,7 @@ async def _openai_stream_with_retry(
     dep_span,  # active OTEL span for dependency call
     session_id: Optional[str] = None,
     client: Optional[Any] = None,
+    refresh_client_cb: Optional[Callable[[], Awaitable[Any]]] = None,
 ) -> Tuple[Iterable[Any], RateLimitInfo]:
     """
     Invoke AOAI streaming with explicit retry and capture rate-limit headers.
@@ -738,6 +757,10 @@ async def _openai_stream_with_retry(
 
     We try the SDK's streaming-response context (if present) to access headers.
     Falls back to normal `.create(**kwargs)`.
+
+    If a refresh callback is provided and we encounter a 401 status code,
+    the callback is invoked to rebuild the client and the request is retried
+    immediately without consuming a normal retry attempt.
     """
     aoai_client = client or default_aoai_client
     _inspect_client_retry_settings(aoai_client)
@@ -838,6 +861,68 @@ async def _openai_stream_with_retry(
 
             _log_rate_limit("AOAI error", last_info)
             _set_span_rate_limit(dep_span, last_info)
+
+            if status == 401 and refresh_client_cb is not None:
+                dep_span.add_event(
+                    "openai_auth_refresh_start",
+                    {"attempt": attempts, "session_id": session_id},
+                )
+                logger.warning(
+                    "AOAI authentication failed (401); refreshing client",
+                    extra={
+                        "attempt": attempts,
+                        "session_id": session_id,
+                        "event_type": "aoai_auth_refresh_start",
+                    },
+                )
+                try:
+                    refreshed_client = await refresh_client_cb()
+                    if refreshed_client is not None:
+                        aoai_client = refreshed_client
+                        dep_span.add_event(
+                            "openai_auth_refresh_success",
+                            {"attempt": attempts, "session_id": session_id},
+                        )
+                        logger.info(
+                            "AOAI client refreshed after 401",
+                            extra={
+                                "attempt": attempts,
+                                "session_id": session_id,
+                                "event_type": "aoai_auth_refresh_success",
+                            },
+                        )
+                        attempts -= 1
+                        continue
+                    dep_span.add_event(
+                        "openai_auth_refresh_noop",
+                        {"attempt": attempts, "session_id": session_id},
+                    )
+                    logger.error(
+                        "Refresh callback returned no client after 401",
+                        extra={
+                            "attempt": attempts,
+                            "session_id": session_id,
+                            "event_type": "aoai_auth_refresh_failure",
+                        },
+                    )
+                except Exception as refresh_exc:  # noqa: BLE001
+                    dep_span.add_event(
+                        "openai_auth_refresh_failure",
+                        {
+                            "attempt": attempts,
+                            "session_id": session_id,
+                            "error_type": type(refresh_exc).__name__,
+                        },
+                    )
+                    logger.error(
+                        "AOAI client refresh failed after 401: %s",
+                        refresh_exc,
+                        extra={
+                            "attempt": attempts,
+                            "session_id": session_id,
+                            "event_type": "aoai_auth_refresh_failure",
+                        },
+                    )
 
             # Decide on retry
             should_retry, reason = _should_retry(exc)
@@ -1134,13 +1219,32 @@ async def process_gpt_response(  # noqa: PLR0913
                 except Exception:
                     pass
 
-                aoai_client = getattr(ws.app.state, "aoai_client", default_aoai_client)
+                aoai_manager = getattr(ws.app.state, "aoai_client_manager", None)
+
+                if aoai_manager is not None:
+                    aoai_client = await aoai_manager.get_client(session_id=session_id)
+                    setattr(ws.app.state, "aoai_client", aoai_client)
+
+                    async def refresh_client_cb() -> Any:
+                        refreshed = await aoai_manager.refresh_after_auth_failure(session_id=session_id)
+                        setattr(ws.app.state, "aoai_client", refreshed)
+                        return refreshed
+
+                else:
+                    aoai_client = getattr(ws.app.state, "aoai_client", default_aoai_client)
+
+                    async def refresh_client_cb() -> Any:
+                        new_client = await asyncio.to_thread(create_azure_openai_client)
+                        setattr(ws.app.state, "aoai_client", new_client)
+                        return new_client
+
                 response_stream, last_rate_info = await _openai_stream_with_retry(
                     chat_kwargs,
                     model_id=model_id,
                     dep_span=dep_span,
                     session_id=session_id,
                     client=aoai_client,
+                    refresh_client_cb=refresh_client_cb,
                 )
 
                 # Consume the stream and emit chunks
@@ -1197,7 +1301,12 @@ async def process_gpt_response(  # noqa: PLR0913
         # Finalize assistant text
         if full_text:
             agent_history.append({"role": "assistant", "content": full_text})
-            await push_final(ws, "assistant", full_text, is_acs=is_acs)
+            await push_final(
+                ws,
+                _get_agent_sender_name(cm, include_autoauth=True),
+                full_text,
+                is_acs=is_acs,
+            )
             await _broadcast_dashboard(ws, cm, full_text, include_autoauth=False)
             span.set_attribute("response.length", len(full_text))
 
@@ -1529,7 +1638,27 @@ async def _handle_tool_call(  # noqa: PLR0913
         )
 
         trace_ctx.add_event("starting_tool_followup")
-        
+
+        # Skip follow-up completions when the tool signals session termination (e.g., voicemail)
+        should_terminate = False
+        if isinstance(result, dict):
+            if result.get("terminate_session") or result.get("voicemail_detected"):
+                should_terminate = True
+            elif isinstance(result.get("data"), dict):
+                data = result["data"]
+                if data.get("terminate_session") or data.get("voicemail_detected"):
+                    should_terminate = True
+
+        if should_terminate:
+            trace_ctx.add_event("tool_requested_termination", {"tool_name": tool_name})
+            logger.info(
+                "Tool %s requested session termination; skipping follow-up completion.",
+                tool_name,
+                extra={"tool_name": tool_name, "event_type": "tool_termination"},
+            )
+            trace_ctx.set_attribute("tool.execution_complete", True)
+            return result or {}
+
         # Validate conversation history before follow-up
         try:
             await _process_tool_followup(
