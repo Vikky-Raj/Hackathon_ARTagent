@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 from fastapi import WebSocket
 
 from .bindings import get_agent_instance
-from .cm_utils import cm_get, cm_set, get_correlation_context
+from .cm_utils import cm_set, get_correlation_context
 from .greetings import send_agent_greeting, sync_voice_from_agent
 from .latency import track_latency
 from apps.rtagent.backend.src.services.acs.session_terminator import (

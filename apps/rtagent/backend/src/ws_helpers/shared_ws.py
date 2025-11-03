@@ -585,9 +585,14 @@ async def send_response_to_acs(
     def _record_status(status: str) -> None:
         try:
             _set_connection_metadata(ws, "acs_last_playback_status", status)
-        except Exception:
-            pass
-
+        except Exception as exc:
+            # Log and continue: failure to set metadata is non-fatal, but should be traceable.
+            logger.warning(
+                "Failed to set ACS playback status metadata (status=%s, run_id=%s): %s",
+                status,
+                getattr(ws, "callConnectionId", None),
+                exc,
+            )
     _record_status("pending")
     playback_status = "pending"
     run_id = str(uuid.uuid4())[:8]

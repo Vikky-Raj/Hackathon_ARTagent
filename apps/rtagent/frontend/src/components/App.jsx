@@ -21,10 +21,7 @@ const getOrCreateSessionId = () => {
     sessionId = `session_${Date.now()}_${tabId}`;
     sessionStorage.setItem(sessionKey, sessionId);
   }
-  //   logger.debug('Created NEW tab-specific session ID:', sessionId);
-  // } else {
-  //   logger.debug('Retrieved existing tab session ID:', sessionId);
-  // }
+  
   
   return sessionId;
 };
