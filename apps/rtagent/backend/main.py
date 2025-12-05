@@ -43,7 +43,14 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from src.pools.connection_manager import ThreadSafeConnectionManager
 from src.pools.session_metrics import ThreadSafeSessionMetrics
-from .src.services import AzureOpenAIClient, CosmosDBMongoCoreManager, AzureRedisManager, SpeechSynthesizer, StreamingSpeechRecognizerFromBytes
+try:
+    from src.services import AzureOpenAIClient
+except ImportError:
+    from apps.rtagent.backend.src.services import AzureOpenAIClient
+from src.cosmosdb.manager import CosmosDBMongoCoreManager
+from src.redis.manager import AzureRedisManager
+from src.speech.text_to_speech import SpeechSynthesizer
+from src.speech.speech_recognizer import StreamingSpeechRecognizerFromBytes
 from src.aoai.client_manager import AoaiClientManager
 from config.app_config import AppConfig
 from config.app_settings import (
@@ -272,9 +279,26 @@ async def lifespan(app: FastAPI):
 
     async def start_core_state() -> None:
         try:
-            app.state.redis = AzureRedisManager()
+            redis_mgr = AzureRedisManager()
+            # Test Redis connectivity with a quick timeout
+            try:
+                loop = asyncio.get_event_loop()
+                ping_result = await asyncio.wait_for(
+                    loop.run_in_executor(None, redis_mgr.ping),
+                    timeout=1.0  # 1 second timeout for quick startup
+                )
+                if ping_result:
+                    app.state.redis = redis_mgr
+                    logger.info("✅ Redis connection validated and ready")
+                else:
+                    logger.warning("⚠️  Redis ping returned False, continuing without Redis for local development")
+                    app.state.redis = None
+            except asyncio.TimeoutError:
+                logger.warning("⚠️  Redis connection timeout, continuing without Redis for local development")
+                app.state.redis = None
         except Exception as exc:
-            raise RuntimeError(f"Azure Managed Redis initialization failed: {exc}")
+            logger.warning(f"⚠️  Redis initialization failed ({exc.__class__.__name__}), continuing without Redis for local development")
+            app.state.redis = None  # Continue without Redis for local development
 
         app.state.conn_manager = ThreadSafeConnectionManager(
             max_connections=app_config.connections.max_connections,
@@ -409,11 +433,11 @@ async def lifespan(app: FastAPI):
     add_step("services", start_external_services)
 
     async def start_agents() -> None:
-        AGENT_AUTH_CONFIG="apps/rtagent/backend/src/agents/artagent/agent_store/auth_agent.yaml"
-        AGENT_CONTRACT_RENEWAL="apps/rtagent/backend/src/agents/artagent/agent_store/contract_renewal_agent.yaml"
-        AGENT_GENERAL_INFO_CONFIG="apps/rtagent/backend/src/agents/artagent/agent_store/general_info_agent.yaml"
-        AGENT_GENERAL_ELEVATOR_INFO_CONFIG="apps/rtagent/backend/src/agents/artagent/agent_store/general_elevator_info_agent.yaml"
-        AGENT_SUPPORT_INTAKE_CONFIG="apps/rtagent/backend/src/agents/artagent/agent_store/support_intake_agent.yaml"
+        AGENT_AUTH_CONFIG="src/agents/artagent/agent_store/auth_agent.yaml"
+        AGENT_CONTRACT_RENEWAL="src/agents/artagent/agent_store/contract_renewal_agent.yaml"
+        AGENT_GENERAL_INFO_CONFIG="src/agents/artagent/agent_store/general_info_agent.yaml"
+        AGENT_GENERAL_ELEVATOR_INFO_CONFIG="src/agents/artagent/agent_store/general_elevator_info_agent.yaml"
+        AGENT_SUPPORT_INTAKE_CONFIG="src/agents/artagent/agent_store/support_intake_agent.yaml"
 
         app.state.auth_agent = ARTAgent(config_path=AGENT_AUTH_CONFIG)
         app.state.claim_intake_agent = ARTAgent(config_path=AGENT_CLAIM_INTAKE_CONFIG)

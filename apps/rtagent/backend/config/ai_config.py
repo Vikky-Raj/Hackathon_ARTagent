@@ -7,24 +7,29 @@ for the real-time voice agent.
 """
 
 import os
+from pathlib import Path
+
+# Get the backend directory (parent of config)
+BACKEND_DIR = Path(__file__).parent.parent
 
 # ==============================================================================
 # AGENT CONFIGURATIONS
 # ==============================================================================
 
-# Agent configuration file paths
+# Agent configuration file paths - relative to backend directory
 AGENT_AUTH_CONFIG = os.getenv(
-    "AGENT_AUTH_CONFIG", "apps/rtagent/backend/src/agents/artagent/agent_store/auth_agent.yaml"
+    "AGENT_AUTH_CONFIG", 
+    str(BACKEND_DIR / "src/agents/artagent/agent_store/auth_agent.yaml")
 )
 
 AGENT_CLAIM_INTAKE_CONFIG = os.getenv(
     "AGENT_CLAIM_INTAKE_CONFIG",
-    "apps/rtagent/backend/src/agents/artagent/agent_store/claim_intake_agent.yaml",
+    str(BACKEND_DIR / "src/agents/artagent/agent_store/claim_intake_agent.yaml"),
 )
 
 AGENT_GENERAL_INFO_CONFIG = os.getenv(
     "AGENT_GENERAL_INFO_CONFIG",
-    "apps/rtagent/backend/src/agents/artagent/agent_store/general_info_agent.yaml",
+    str(BACKEND_DIR / "src/agents/artagent/agent_store/general_info_agent.yaml"),
 )
 
 # ==============================================================================

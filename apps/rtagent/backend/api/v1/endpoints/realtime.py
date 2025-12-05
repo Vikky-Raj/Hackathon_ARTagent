@@ -452,7 +452,11 @@ async def _initialize_conversation_session(
     :raises Exception: If session initialization fails
     """
     redis_mgr = websocket.app.state.redis
-    memory_manager = MemoManager.from_redis(session_id, redis_mgr)
+    try:
+        memory_manager = MemoManager.from_redis(session_id, redis_mgr) if redis_mgr else MemoManager()
+    except Exception as exc:
+        logger.warning(f"[{session_id}] Redis unavailable, using in-memory session: {exc}")
+        memory_manager = MemoManager()
 
     # Acquire per-connection TTS synthesizer from pool
     tts_pool = websocket.app.state.tts_pool
@@ -640,14 +644,15 @@ async def _initialize_conversation_session(
         cm_set(memory_manager, greeting_sent=True)
         greeting_sent = True
         redis_mgr = websocket.app.state.redis
-        try:
-            await memory_manager.persist_to_redis_async(redis_mgr)
-        except Exception as persist_exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to persist greeting_sent flag: %s",
-                session_id,
-                persist_exc,
-            )
+        if redis_mgr:  # Only persist if Redis is available
+            try:
+                await memory_manager.persist_to_redis_async(redis_mgr)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] Failed to persist greeting_sent flag: %s",
+                    session_id,
+                    persist_exc,
+                )
     else:
         active_agent = cm_get(memory_manager, "active_agent", None)
         active_agent_voice = cm_get(memory_manager, "active_agent_voice", None)
@@ -679,7 +684,11 @@ async def _initialize_conversation_session(
         )
 
     # Persist initial state to Redis
-    await memory_manager.persist_to_redis_async(redis_mgr)
+    if redis_mgr:  # Only persist if Redis is available
+        try:
+            await memory_manager.persist_to_redis_async(redis_mgr)
+        except Exception as exc:
+            logger.warning(f"[{session_id}] Failed to persist initial state: {exc}")
 
     # Set up STT callbacks
     def on_partial(txt: str, lang: str, speaker_id: str):
