@@ -176,7 +176,8 @@ const styles = {
     width: "100%",
     height: "60%",
     padding: "0 10px",
-    background: "radial-gradient(ellipse at center, rgba(100, 116, 139, 0.05) 0%, transparent 70%)",
+    background:
+      "radial-gradient(ellipse at center, rgba(100, 116, 139, 0.05) 0%, transparent 70%)",
     borderRadius: "6px",
   },
 
@@ -2819,6 +2820,16 @@ function RealTimeVoiceApp() {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: TARGET_SAMPLE_RATE,
     });
+    if (audioCtx.state === "suspended") {
+      try {
+        await audioCtx.resume();
+        logger.info("Mic AudioContext resumed after user gesture");
+      } catch (err) {
+        logger.error("Failed to resume AudioContext", err);
+        appendLog("❌ Unable to start microphone (resume failed)");
+        return;
+      }
+    }
     audioContextRef.current = audioCtx;
     const sourceSampleRate = audioCtx.sampleRate;
     if (sourceSampleRate !== TARGET_SAMPLE_RATE) {

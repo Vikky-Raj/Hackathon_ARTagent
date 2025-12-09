@@ -12,7 +12,7 @@ agent:
     Strictly uses tool-calling—never provides claim advice or answers outside its function scope.
 
 model:
-  deployment_id: gpt-4o
+  deployment_id: gpt-4o-mini
   temperature: 0.60
   top_p: 0.9
   # max_tokens: 2024
@@ -27,8 +27,8 @@ prompts:
   path: fnol_intake_agent.jinja
 
 tools:
-  - record_fnol            # Create / store a FNOL claim
-  - authenticate_caller    # Verify caller identity
-  - escalate_emergency     # Immediate medical / fire escalation
-  - handoff_general_agent  # Route to “General Insurance Questions” AI agent
-  - escalate_human         # Non-emergency human hand-off (fraud, loops, abuse)
+  - record_fnol # Create / store a FNOL claim
+  - authenticate_caller # Verify caller identity
+  - escalate_emergency # Immediate medical / fire escalation
+  - handoff_general_agent # Route to “General Insurance Questions” AI agent
+  - escalate_human # Non-emergency human hand-off (fraud, loops, abuse)
