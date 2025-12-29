@@ -114,6 +114,25 @@ Pick one of three ways to run the voice inference layer—the rest of the framew
 
 ## **Getting started**
 
+### **🚀 Quick Start with Docker (Recommended for Local Development)**
+
+Run the complete stack locally with PostgreSQL database:
+
+```bash
+git clone https://github.com/Vikky-Raj/Hackathon_ARTagent.git
+cd Hackathon_ARTagent
+cp .env.example .env
+docker compose up --build
+```
+
+Access the application:
+- **API Documentation**: http://localhost:8010/docs
+- **Frontend**: http://localhost:8080
+
+📖 **See [QUICKSTART.md](QUICKSTART.md) for detailed Docker setup**
+
+### **☁️ Cloud Deployment**
+
 > [!TIP]
 > Not an Infrastructure-as-Code person? Start by skimming the [deployment guide](docs/deployment/README.md). You've got two easy deployment paths—azd (one-command) or Terraform + Makefile—but you could also deploy the infrastructure from the Azure Portal UI or reuse your current infrastructure if it matches the requirements. Once your cloud resources are up, follow [`docs/getting-started/local-development.md`](docs/getting-started/local-development.md) for a step-by-step local run.
 
