@@ -13,6 +13,7 @@ from .feature_flags import *
 from .ai_config import *
 from .security_config import *
 from .infrastructure import *
+from .database_config import *
 
 # ==============================================================================
 # VALIDATION FUNCTIONS
